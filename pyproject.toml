@@ -1,0 +1,26 @@
+[project]
+name = "stremio-api-tools"
+version = "1.0.0"
+requires-python = ">=3.13"
+dependencies = [
+    "requests>=2.34.2",
+]
+
+[tool.pyrefly]
+project-includes = [
+    "**/*.py*",
+    "**/*.ipynb",
+]
+
+[tool.ruff.lint]
+extend-select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # Pyflakes (unused vars/imports, undefined names)
+    "I",   # isort (import sorting)
+    "UP",  # pyupgrade (modern Python syntax)
+    "B",   # flake8-bugbear (likely bugs and design issues)
+]
+ignore = [
+    "E501",  # ignore "line too long"
+]

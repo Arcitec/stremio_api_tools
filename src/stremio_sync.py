@@ -51,8 +51,8 @@ def stremio_rpc(
 
     When `debug_dir` is provided, the raw JSON response is immediately written to:
         `<debug_dir>/api_<unixtime_ms>_<method>.json`
-    Logging inside `stremio_rpc` ensures raw responses are captured immediately
-    as each request completes, even if a multi-batch sync is aborted with Ctrl-C.
+    This logging ensures raw responses are captured immediately as each request
+    completes, even if a multi-batch sync is aborted with Ctrl-C.
     """
     response = requests.post(f"{API_BASE}/{method}", json=payload, timeout=30)
     response.raise_for_status()
@@ -107,6 +107,15 @@ def decode_watched_bitfield(watched_str: str) -> dict[str, Any]:
     except Exception:  # noqa: BLE001
         return {"last_video_id": last_video_id, "watched_episode_indices": []}
 
+    # WARNING: To map these indices into actual season/episode numbers, you MUST
+    # query Stremio's active metadata addon to get the list of episodes from it.
+    # Never assume that "0 = season 1, episode 1", since a show's "specials" (such
+    # as behind-the-scenes episodes) are usually stored as "Season 0" at the
+    # start of the episode list.
+    # NOTE: The ONLY correct way to make the episode list useful is to query the
+    # list of installed Stremio addons (via the `addonCollectionGet` API), find
+    # the active metadata addon, verify that it supports the series ID (in the
+    # addon's `idPrefixes` list), and finally fetch its episode list metadata.
     watched_indices = [
         bit_idx
         for bit_idx in range(item_count)

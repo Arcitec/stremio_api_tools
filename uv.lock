@@ -151,7 +151,7 @@ wheels = [
 ]
 
 [[package]]
-name = "stremio-api-reference"
+name = "stremio-api-tools"
 version = "1.0.0"
 source = { virtual = "." }
 dependencies = [

@@ -62,15 +62,22 @@ def stremio_rpc(
     if debug_dir is not None:
         timestamp_ms = int(time.time() * 1000)
         sanitized = copy.deepcopy(raw_data)
+        safe_method = method.replace("/", "_")
 
-        # Strip sensitive account identifiers from `getUser` before saving debug logs.
-        if method == "getUser" and isinstance(sanitized.get("result"), dict):
-            if "_id" in sanitized["result"]:
-                sanitized["result"]["_id"] = "ANONYMOUS"
-            if "email" in sanitized["result"]:
-                sanitized["result"]["email"] = "anonymous@example.com"
+        # Strip sensitive account identifiers and profile session keys before saving debug logs.
+        result = sanitized.get("result")
+        if isinstance(result, dict):
+            if method == "getUser":
+                if "_id" in result:
+                    result["_id"] = "ANONYMOUS"
+                if "email" in result:
+                    result["email"] = "anonymous@example.com"
+                if "parent_id" in result:
+                    result["parent_id"] = "ANONYMOUS_PARENT"
+            elif method == "premiumPrefs/authenticateProfile" and "authKey" in result:
+                result["authKey"] = "REDACTED"
 
-        debug_path = debug_dir / f"api_{timestamp_ms}_{method}.json"
+        debug_path = debug_dir / f"api_{timestamp_ms}_{safe_method}.json"
         save_atomic(debug_path, sanitized)
 
     if raw_data.get("error"):

@@ -25,6 +25,7 @@ API_BASE = "https://api.strem.io/api"
 DEFAULT_OUTPUT_FILE = Path("output/stremio_data.json")
 DEFAULT_BATCH_SIZE = 500
 DEFAULT_SLEEP_SECONDS = 1.0
+MAX_WATCHED_BITFIELD_BYTES = 65536
 
 
 def save_atomic(path: Path, data: Any) -> None:
@@ -79,15 +80,62 @@ def stremio_rpc(
 
 def decode_watched_bitfield(watched_str: str) -> dict[str, Any]:
     """
-    Decode Stremio's series `state.watched` string into 0-based episode indices.
+    Decode Stremio's series `state.watched` string into raw 0-based bit indices.
 
     Wire format:
-        `<last_video_id>:<total_indexed_items>:<base64_zlib_bitset>`
+        `<anchor_video_id>:<anchor_length>:<base64_zlib_bitset>`
 
-    Note: `<last_video_id>` itself contains colons (e.g. `tt0903747:1:1`),
-    so the string MUST be split from the right (`rsplit(":", 2)`).
-    The decompressed payload is an LSB-first bitfield where bit `i` indicates
-    whether episode `i` (in Cinemeta's episode list order) has been watched.
+    Note: `<anchor_video_id>` is a metadata addon episode ID that itself contains
+    colons; typically `<series_id>:<season>:<episode>` (e.g. `tt0903747:1:1` or
+    `tmdb:12345:2:5`), or `<series_id>:<episode>` for addons without seasons
+    (e.g. `kitsu:12345:1`). Because the video ID has a variable number of colons,
+    the string MUST be split from the right (`rsplit(":", 2)`).
+
+    Note on `"undefined:1:..."` Strings:
+    When a series record is initialized or bulk-flagged without an active episode
+    anchor, Stremio can emit `"undefined:1:eJwDAAAAAAE="` (which decompresses to
+    a zeroed byte). Those are treated as unanchored/empty bitfields (which means
+    `last_video_id: None`).
+
+    Indexing & Anchor Alignment (Important for Mapping to Episodes):
+    ----------------------------------------------------------------
+    All bit positions in `watched_episode_indices` and all video list indices
+    are **0-based** (bit `0` is the first bit; index `0` is the first sorted video).
+
+    `anchor_length` is the number of videos from index `0` up to and including
+    `last_video_id` at the time the bitfield was saved:
+      - Example: If `last_video_id` was at 0-based index `2` (the 3rd video),
+        the slice `[0, 1, 2]` has length `3`, so `anchor_length == 3` and raw
+        bit `2` (`anchor_length - 1`) represents `last_video_id`.
+      - Episodes watched *after* the anchor in the sorted list still have bits
+        set at positions `>= anchor_length`, which is why all decompressed bits
+        are scanned rather than stopping at `anchor_length`.
+
+    To resolve `watched_episode_indices` to concrete episodes using a metadata addon:
+      1. Query installed Stremio addons (`POST /api/addonCollectionGet`), find the
+         active metadata addon supporting `"meta"` for `"series"` whose `idPrefixes`
+         matches the series ID, and fetch `<transportUrl>/meta/series/<id>.json`.
+      2. Sort `meta.videos` ascending by `(season, episode, released_timestamp_ms)`
+         (using `-inf` when a field is missing/null).
+      3. Find the anchor's current 0-based index: `at = sorted_video_ids.index(last_video_id)`.
+      4. Compute the shift `offset = (anchor_length - 1) - at`. Each raw bit `b`
+         maps to `sorted_video_ids[b - offset]`. (For example, if one Season 0
+         special was added before the anchor, `at` increases by 1, `offset`
+         becomes `-1`, and `b - (-1)` shifts every episode index right by 1 so
+         watched marks stay aligned.)
+      5. Unanchored "watch-all" edge case: when a user marks an entire series
+         watched in bulk without watching a specific anchor episode, Stremio may
+         emit `anchor_length == 1` with `watched_episode_indices == []` alongside
+         `flagged_watched > 0` on the parent series record.
+
+    Return Value:
+    -------------
+    Returns a dictionary containing `last_video_id` and `watched_episode_indices`.
+    The `anchor_length` key is only emitted when the entire `watched` string (including
+    the anchor ID, integer anchor length, and zlib-compressed bitset), is successfully
+    parsed and decompressed; if the string is malformed, unanchored (`"undefined"`),
+    or fails decompression, `anchor_length` is omitted and `watched_episode_indices`
+    defaults to `[]`.
     """
     if not watched_str or ":" not in watched_str:
         return {"last_video_id": None, "watched_episode_indices": []}
@@ -96,36 +144,38 @@ def decode_watched_bitfield(watched_str: str) -> dict[str, Any]:
     if len(parts) != 3:
         return {"last_video_id": watched_str, "watched_episode_indices": []}
 
-    last_video_id, item_count_str, b64_payload = parts
+    last_video_id, anchor_length_str, b64_payload = parts
+    if not last_video_id or last_video_id == "undefined":
+        return {"last_video_id": None, "watched_episode_indices": []}
+
     try:
-        item_count = int(item_count_str)
+        anchor_length = int(anchor_length_str)
     except ValueError:
         return {"last_video_id": watched_str, "watched_episode_indices": []}
 
+    if anchor_length < 1:
+        return {"last_video_id": last_video_id, "watched_episode_indices": []}
+
     try:
-        raw_bytes = zlib.decompress(base64.b64decode(b64_payload))
+        decompressor = zlib.decompressobj()
+        raw_bytes = decompressor.decompress(
+            base64.b64decode(b64_payload), MAX_WATCHED_BITFIELD_BYTES
+        )
+        if decompressor.unconsumed_tail:
+            return {"last_video_id": last_video_id, "watched_episode_indices": []}
     except Exception:  # noqa: BLE001
         return {"last_video_id": last_video_id, "watched_episode_indices": []}
 
-    # WARNING: To map these indices into actual season/episode numbers, you MUST
-    # query Stremio's active metadata addon to get the list of episodes from it.
-    # Never assume that "0 = season 1, episode 1", since a show's "specials" (such
-    # as behind-the-scenes episodes) are usually stored as "Season 0" at the
-    # start of the episode list.
-    # NOTE: The ONLY correct way to make the episode list useful is to query the
-    # list of installed Stremio addons (via the `addonCollectionGet` API), find
-    # the active metadata addon, verify that it supports the series ID (in the
-    # addon's `idPrefixes` list), and finally fetch its episode list metadata.
+    total_bits = len(raw_bytes) * 8
     watched_indices = [
         bit_idx
-        for bit_idx in range(item_count)
-        if (bit_idx // 8) < len(raw_bytes)
-        and (raw_bytes[bit_idx // 8] & (1 << (bit_idx % 8)))
+        for bit_idx in range(total_bits)
+        if raw_bytes[bit_idx // 8] & (1 << (bit_idx % 8))
     ]
 
     return {
         "last_video_id": last_video_id,
-        "total_indexed_items": item_count,
+        "anchor_length": anchor_length,
         "watched_episode_indices": watched_indices,
     }
 
